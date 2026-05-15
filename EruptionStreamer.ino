@@ -1,202 +1,3 @@
-/*
-================================================================================
-  ERUPTION STREAMER - ESP32 Internet Radio mit VS1053 MP3-Decoder & OLED Display
-================================================================================
-
-PROJEKT-KONZEPT:
-================================================================================
-Dieses Projekt realisiert einen "SMART RADIO STREAMER" basierend auf einem
-ESP32-Mikrocontroller. Das Kernziel ist die Wiedergabe von Internet-Radiostreams
-(hier: Eruption Radio UK) mit ECHTZEIT-SPEKTRUMVISUALISIERUNG auf einem 128x64
-OLED-Display.
-
-HARDWARE-KOMPONENTEN:
-  • ESP32:        Hauptcontroller, WiFi/BLE, SPI/I2C Kommunikation
-  • VS1053:       Dedizierter MP3-Decoder mit DSP-Prozessor & Spectrum Analyzer
-  • SSD1306:      128x64 Pixel OLED Display (I2C)
-  • WiFi:         Für Streaming-Verbindung zum Radio-Server
-
-ARCHITEKTUR:
-================================================================================
-
-1. STREAMING-LAYER (WiFi → VS1053)
-   - Verbindung zu streaming04.liveboxstream.uk:8116
-   - HTTP/1.0 GET-Request mit Icy-MetaData=0
-   - Pufferbasierte Datenaufnahme (max. 10 Chunks/Loop) → non-blocking
-   - Automatisches Reconnect bei Timeouts (12 Sekunden Inaktivität)
-   - Robuste Fehlerbehandlung mit VS1053-Reset
-
-2. AUDIO-DECODING (VS1053)
-   - Zuverlässige Initialisierung mit 10 Versuchen + Hardware-Reset
-   - SPI-Schnittstelle für Kontrolldaten (SCI Register)
-   - Volumen auf 72 (0-255) eingestellt
-   - MP3-Mode aktiviert nach Init
-
-3. SPECTRUM ANALYZER (DSP Plugin)
-   - Lädt User-Code (spectrumAnalyzer1053b Plugin) in VS1053 RAM
-   - Dynamische Laufzeit-Erkennung der FFT-Bandadressen:
-     * 0x1802 / 0x1804 (Variante A)
-     * 0x1812 / 0x1824 (Variante B)
-   - Rohdaten: 6-Bit current + 6-Bit peak-hold pro Band
-   - Max. 14 Bänder (konfigurierbar), hier: 10 Bänder aktiv
-
-4. DISPLAY-VISUALISIERUNG (SSD1306 OLED)
-   - 128x64 Pixel Monochrom OLED
-   - "10-CH REAL FFT BOARD" Echtzeit-Spektrumdarstellung
-   - Pro Band:
-     * Dynamisches Gain-System (24.0 Bass → 10.0 Höhen)
-     * Kinetische Peak-Hold mit Schwerkraft-Animation
-     * Cyber-Skelett-Balken mit diagonalen Linien-Muster
-     * Laser-Peak als schwebendes Element über der Säule
-   - 10px Balkenbreite + 2px Abstand = optimale Displayauslastung
-
-TIMING & NICHT-BLOCKIERENDES DESIGN:
-================================================================================
-Das gesamte System arbeitet mit striktem Non-Blocking-Design:
-
-  • Loop-Frequenz:            ~1000-2000 Hz (unkritisch, kein delay())
-  • Spektrum-Leseintervall:   SPECTRUM_INTERVAL_MS = 10ms
-  • Display-Aktualisierung:   Gekoppelt an Spektrum (~100 FPS)
-  • Debug-Ausgaben:           DEBUG_INTERVAL_MS = 2000ms
-  • Stream-Timeout:           STREAM_TIMEOUT_MS = 12000ms
-  • WiFi-Reconnect-Verzögerung: RECONNECT_DELAY_MS = 5000ms
-
-Blockade-freie Stream-Aufnahme:
-  - Nur max. 10 MP3-Daten-Chunks pro loop() aufgelesen
-  - Verhindert UI-Einfrierung
-  - MP3buff (32 Bytes) puffert zwischen Netzwerk und VS1053
-
-FEHLERHAFT-HANDLING & ROBUSTHEIT:
-================================================================================
-1. VS1053 Init:     10 Versuche mit HW-Reset + Chip-Version Verifikation
-2. Plugin-Laden:    Mit Verzögerung, Adress-Erkennung im Betrieb
-3. WiFi-Rekonnect: Automatisch bei Verbindungsverlust (10s Timeout)
-4. Stream-Reconnect: Watchdog bei 12s Datenstille, VS1053-Reset, Neustart
-5. Display-Fehler:  Graceful Degradation (displayReady Flag)
-
-DATENFLUSS-DIAGRAMM:
-================================================================================
-
-        [Eruption Radio UK Server]
-                  ↓ (HTTP Stream)
-        [WiFi → ESP32 TCP Client]
-                  ↓ (32-Byte Chunks)
-        [VS1053 MP3 Decoder]
-                  ├→ [Audio-Ausgang]
-                  └→ [FFT Spectrum Analyzer (DSP)]
-                       ↓ (Band-Daten @ 0x1802/0x1812)
-                  [ESP32 WRAM-Leser]
-                       ↓
-                  [Kinetische Peak-Animation]
-                       ↓
-        [SSD1306 OLED Renderer]
-
-VERWENDETE REGISTER & ADRESSEN:
-================================================================================
-  SCI_WRAMADDR (0x07):    Setzt Lese-Adresse im VS1053 WRAM
-  SCI_WRAM (0x06):        Liest 16-Bit Daten vom WRAM
-  0x1802/0x1804:          FFT-Plugin Standardaddressen (14 Bänder)
-  0x1812/0x1824:          FFT-Plugin Alternative (14 Bänder)
-
-FFT-Daten-Format pro Band (16-Bit):
-  Bits 0-5:   current   (0-63 → 0-31 nach Normalisierung)
-  Bits 6-11:  peak      (0-63 → 0-31 nach Normalisierung)
-  Bits 12-15: reserved
-
-DYNAMISCHES GAIN-SYSTEM (drawSpectrum):
-================================================================================
-Das Menschliche Ohr nimmt Höhen schwächer wahr als Tiefen. Das Plugin
-liefert ebenfalls schwächere Höhen. Daher adaptive Schwellenwerte pro Band:
-
-  Band 0-1 (Sub-Bass):     currentGain = 24.0
-  Band 2-4 (Bass/Mitten):  currentGain = 20.0
-  Band 5-6 (Ob.-Mitten):   currentGain = 16.0
-  Band 7 (Präsenz):        currentGain = 12.0
-  Band 8-9 (Höhen):        currentGain = 10.0
-
-Dies erzeugt eine "ausgeglichene" visuelle Darstellung auch bei Streaming.
-
-PEAK-HOLD & GRAVITY-ANIMATION:
-================================================================================
-Jeder Peak merkt sich die höchste erreichtePosition und fällt dann
-sanft nach unten mit Gravitationsbeschleunigung:
-
-  1. Wenn neue Bar > Peak:  Peak = new, Gravity = 0 (instant)
-  2. Sonst:                 Gravity += 0.40; Peak -= Gravity
-  3. Smooth Falloff → Auge verfolgt die Animation besser
-
-=> "Laser-Peak" visuell über der Bar sichtbar
-
-INITIALISIERUNGS-SEQUENZ:
-================================================================================
-setup():
-  1. Serial @ 115200 Baud + System-Info (CPU MHz, Free Heap)
-  2. VS1053 Zuverlässige Init (10x mit HW-Reset)
-     → Halt wenn fehlgeschlagen
-  3. Spectrum Analyzer Plugin laden
-  4. OLED Init & "VS1053 OK" Message
-  5. WiFi-Verbindung zu SSID/Pass (aus cred.h)
-  6. Stream-Verbindung zu Eruption Radio UK
-
-loop():
-  • Alle 10ms:    readSpectrum() + drawSpectrum()
-  • Alle 2sec:    Debug-Output (aktuell deaktiviert)
-  • Kontinuierlich: readStreamToVS1053(), WiFi-Maintenance, Reconnect-Check
-
-SICHERHEITSMERKMALE:
-================================================================================
-• Status-Flags:         vs1053Ready, pluginReady, displayReady, streamReady
-• Timeout-Watchdogs:    12s Stream-Timeout, 5s Reconnect-Verzögerung
-• Register-Verifikation: Chip-Version = 4 erforderlich
-• Adress-Dynamik:       Bandadresse wird zur Laufzeit erkannt
-• Max-Chunks-Limiting:   10er Loop-Limit gegen Blockade
-
-KONFIGURIERBARE PARAMETER:
-================================================================================
-Oben in der Datei (Defines):
-  - USE_DISPLAY:          1=OLED aktiv, 0=OLED aus
-  - VOLUME:               72 (0-255)
-  - STREAM_TIMEOUT_MS:    12000
-  - RECONNECT_DELAY_MS:   5000
-  - MAX_BANDS:            14
-
-Externe Konfiguration (cred.h):
-  - ssid:                 WiFi SSID
-  - pass:                 WiFi Passwort
-
-ABHÄNGIGKEITEN:
-================================================================================
-  • VS1053:               VS1053 Library (SPI-Decoder-Steuerung)
-  • WiFi:                 ESP32 WiFi Core
-  • Wire:                 I2C für OLED
-  • Adafruit_SSD1306:     OLED-Display-Treiber
-  • Adafruit_GFX:         Grafikprimitiven (drawRect, drawLine)
-  • spectrumAnalyzer1053b.h: Binary Plugin Code (DSP-Firmware)
-
-DEBUGGING & TROUBLESHOOTING:
-================================================================================
-Serial Monitor (115200 Baud) zeigt:
-  [VS1053]:  Hardware-Status
-  [PLUGIN]:  FFT-Plugin Erkennungsergebnisse
-  [OLED]:    Display-Status
-  [WIFI]:    Verbindungsstatus
-  [STREAM]:  Streaming-Fehler und Reconnects
-  [SPEC]:    Spektrum-Daten (Debug-Mode)
-
-Performance:
-  • CPU-Auslastung: ~40-60% (MP3-Decode + FFT + OLED-Rendering)
-  • Free Heap: Typisch 180-220 KB (von ~320 KB)
-  • Keine unkontrollierten Speicherlecks
-
-================================================================================
-Autor:              DE8MSH
-Projekt-Typ:        Internet Radio Streamer + Echtzeit-Spektrumvisualisierung
-Komplexität:        Fortgeschritten (Embedded Linux, DSP, Hardware-Integration)
-Letzte Änderung:    Dynamic Fix 2 (Stabile Init & Blockade-freier Stream)
-================================================================================
-*/
-
-
 #include <SPI.h>
 #include <VS1053.h>
 #include <WiFi.h>
@@ -595,81 +396,103 @@ void drawSpectrum() {
 
   display.clearDisplay();
 
-  // 1. Titel oben anzeigen
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(20, 0);
-  display.print("10-CH REAL FFT BOARD");
-
-  int graphHeight = 44;
-  int graphBottom = 63;
-  int barWidth = 10;
+  int centerY = 32;     
+  int maxHalfHeight = 31; 
+  int barWidth = 11;      
   int gap = 2;
-  int startX = 5; // 5 Pixel Rand links für perfekte Zentrierung
+  int startX = 0;
 
-  // Statische Arrays für die kinetischen Peaks (jetzt fest auf 10 ausgelegt)
-  static float peaks[10] = {0};
-  static float gravity[10] = {0};
-
-  // 2. Schleife über alle 10 realen Bänder (0 bis 9)
   for (uint8_t i = 0; i < 10; i++) {
-    // Sicherheitsabfrage, falls das Plugin im Betrieb mal zickt
     if (i >= bandCount) break; 
 
-    // 3. DYNAMISCHES GAIN-SYSTEM PRO BAND
-    // Da die ganz hohen Frequenzen bauartbedingt schwächer reinkommen,
-    // staffeln wir den Schwellenwert von 24 (Bass) runter bis auf 10 (Höhen).
+    // 1. Gain-System
     float currentGain = 24.0;
-    if (i == 0 || i == 1) currentGain = 24.0; // Tiefer Bass
-    else if (i <= 4)      currentGain = 20.0; // Untere Mitten
-    else if (i <= 6)      currentGain = 16.0; // Obere Mitten
-    else if (i == 7)      currentGain = 12.0; // Präsenz
-    else                  currentGain = 10.0; // Die echten Höhen (Band 8 & 9)
+    if (i == 0 || i == 1) currentGain = 24.0; 
+    else if (i <= 4)      currentGain = 22.0; 
+    else if (i <= 6)      currentGain = 20.0; 
+    else if (i == 7)      currentGain = 18.0; 
+    else                  currentGain = 16.0; 
 
-    // Rohen Wert begrenzen und auf Displayhöhe mappen
-    int barH = map(constrain(spectrum[i], 0, currentGain), 0, currentGain, 0, graphHeight);
-
-    // 4. KINETISCHE PEAKS BERECHNEN (Sofort hoch, geschmeidig runter)
-    if (barH > peaks[i]) {
-      peaks[i] = barH;
-      gravity[i] = 0;
-    } else {
-      gravity[i] += 0.40; // Knackiger, schneller Fall für das 10-Band-Board
-      peaks[i] -= gravity[i];
-      if (peaks[i] < 0) peaks[i] = 0;
-    }
-
-    // 5. GEOMETRIE BERECHNEN
+    int halfBarH = map(constrain(spectrum[i], 0, currentGain), 0, currentGain, 0, maxHalfHeight);
     int x = startX + (i * (barWidth + gap));
-    int y = graphBottom - barH;
 
-    // 6. CYBER-SKELETT BARS ZEICHNEN
-    if (barH > 0) {
-      // Äußere Kontur
-      display.drawRect(x, y, barWidth, barH, SSD1306_WHITE);
+    if (halfBarH > 0) {
+      int yTop = centerY - halfBarH;
+      int yBottom = centerY + halfBarH;
+
+      // 2. DAS INTELLIGENTE 8-STUFEN-RASTER
       
-      // Filigranes Cyber-Doppelkreuz im Inneren (angepasst auf 10px Breite)
-      for (int step = y; step < graphBottom; step += 6) {
-        if (step + 6 <= graphBottom) {
-          display.drawLine(x, step, x + barWidth - 1, step + 6, SSD1306_WHITE);
-          display.drawLine(x + barWidth - 1, step, x, step + 6, SSD1306_WHITE);
+      // STUFE 8: 100% – Vollweiß (Ab 28 Pixel Höhe)
+      if (halfBarH >= 28) {
+        display.fillRect(x, yTop, barWidth, halfBarH * 2, SSD1306_WHITE);
+      }
+      
+      // STUFE 7: 87.5% – Fast voll
+      else if (halfBarH >= 24) {
+        for (int py = yTop; py <= yBottom; py++) {
+          for (int px = x; px < x + barWidth; px++) {
+            if ((px * 3 + py) % 8 != 0) display.drawPixel(px, py, SSD1306_WHITE);
+          }
         }
       }
-    } else {
-      // Flache Baseline bei Stille
-      display.drawFastHLine(x, graphBottom, barWidth, SSD1306_WHITE);
-    }
+      
+      // STUFE 6: 75% – Dichtes Schachbrett
+      else if (halfBarH >= 20) {
+        for (int py = yTop; py <= yBottom; py++) {
+          for (int px = x; px < x + barWidth; px++) {
+            if ((px + py) % 4 != 0) display.drawPixel(px, py, SSD1306_WHITE);
+          }
+        }
+      }
+      
+      // STUFE 5: 62.5% – Engmaschig
+      else if (halfBarH >= 16) {
+        for (int py = yTop; py <= yBottom; py++) {
+          for (int px = x; px < x + barWidth; px++) {
+            if (((px + py) % 2 == 0) || (py % 4 == 0)) display.drawPixel(px, py, SSD1306_WHITE);
+          }
+        }
+      }
+      
+      // STUFE 4: 50% – Horizontale Linien
+      else if (halfBarH >= 12) {
+        for (int py = yTop; py <= yBottom; py++) {
+          if (py % 2 == 0) display.drawFastHLine(x, py, barWidth, SSD1306_WHITE);
+        }
+      }
+      
+      // STUFE 3: 37.5% – Offenes Muster
+      else if (halfBarH >= 8) {
+        for (int py = yTop; py <= yBottom; py++) {
+          for (int px = x; px < x + barWidth; px++) {
+            if ((px * 2 + py) % 3 == 0) display.drawPixel(px, py, SSD1306_WHITE);
+          }
+        }
+      }
+      
+      // STUFE 2: 25% – Feines Punktgitter
+      else if (halfBarH >= 4) {
+        for (int py = yTop; py <= yBottom; py++) {
+          for (int px = x; px < x + barWidth; px++) {
+            if (px % 2 == 0 && py % 2 == 0) display.drawPixel(px, py, SSD1306_WHITE);
+          }
+        }
+      }
+      
+      // STUFE 1: 12.5% – Hauchdünner Schein (1 bis 3 Pixel Höhe)
+      else {
+        for (int py = yTop; py <= yBottom; py++) {
+          for (int px = x; px < x + barWidth; px++) {
+            if ((px + py) % 4 == 0 && px % 2 == 0) display.drawPixel(px, py, SSD1306_WHITE);
+          }
+        }
+      }
 
-    // 7. DER LASER-PEAK (Schwebendes Element über der Säule)
-    int peakY = graphBottom - (int)peaks[i];
-    if (peakY < graphBottom) {
-      // Bei 10px Breite steht der Peak links und rechts 1 Pixel über
-      display.drawFastHLine(x - 1, peakY, barWidth + 2, SSD1306_WHITE);
+    } else {
+      // K.I.T.T.-Mittellinie bei absolutem Schweigen
+      display.drawFastHLine(x, centerY, barWidth, SSD1306_WHITE);
     }
   }
-
-  // Dekorative Trennlinie unter dem Titel
-  display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
 
   display.display();
 #endif
