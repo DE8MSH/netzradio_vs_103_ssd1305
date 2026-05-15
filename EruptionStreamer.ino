@@ -1,3 +1,202 @@
+/*
+================================================================================
+  ERUPTION STREAMER - ESP32 Internet Radio mit VS1053 MP3-Decoder & OLED Display
+================================================================================
+
+PROJEKT-KONZEPT:
+================================================================================
+Dieses Projekt realisiert einen "SMART RADIO STREAMER" basierend auf einem
+ESP32-Mikrocontroller. Das Kernziel ist die Wiedergabe von Internet-Radiostreams
+(hier: Eruption Radio UK) mit ECHTZEIT-SPEKTRUMVISUALISIERUNG auf einem 128x64
+OLED-Display.
+
+HARDWARE-KOMPONENTEN:
+  • ESP32:        Hauptcontroller, WiFi/BLE, SPI/I2C Kommunikation
+  • VS1053:       Dedizierter MP3-Decoder mit DSP-Prozessor & Spectrum Analyzer
+  • SSD1306:      128x64 Pixel OLED Display (I2C)
+  • WiFi:         Für Streaming-Verbindung zum Radio-Server
+
+ARCHITEKTUR:
+================================================================================
+
+1. STREAMING-LAYER (WiFi → VS1053)
+   - Verbindung zu streaming04.liveboxstream.uk:8116
+   - HTTP/1.0 GET-Request mit Icy-MetaData=0
+   - Pufferbasierte Datenaufnahme (max. 10 Chunks/Loop) → non-blocking
+   - Automatisches Reconnect bei Timeouts (12 Sekunden Inaktivität)
+   - Robuste Fehlerbehandlung mit VS1053-Reset
+
+2. AUDIO-DECODING (VS1053)
+   - Zuverlässige Initialisierung mit 10 Versuchen + Hardware-Reset
+   - SPI-Schnittstelle für Kontrolldaten (SCI Register)
+   - Volumen auf 72 (0-255) eingestellt
+   - MP3-Mode aktiviert nach Init
+
+3. SPECTRUM ANALYZER (DSP Plugin)
+   - Lädt User-Code (spectrumAnalyzer1053b Plugin) in VS1053 RAM
+   - Dynamische Laufzeit-Erkennung der FFT-Bandadressen:
+     * 0x1802 / 0x1804 (Variante A)
+     * 0x1812 / 0x1824 (Variante B)
+   - Rohdaten: 6-Bit current + 6-Bit peak-hold pro Band
+   - Max. 14 Bänder (konfigurierbar), hier: 10 Bänder aktiv
+
+4. DISPLAY-VISUALISIERUNG (SSD1306 OLED)
+   - 128x64 Pixel Monochrom OLED
+   - "10-CH REAL FFT BOARD" Echtzeit-Spektrumdarstellung
+   - Pro Band:
+     * Dynamisches Gain-System (24.0 Bass → 10.0 Höhen)
+     * Kinetische Peak-Hold mit Schwerkraft-Animation
+     * Cyber-Skelett-Balken mit diagonalen Linien-Muster
+     * Laser-Peak als schwebendes Element über der Säule
+   - 10px Balkenbreite + 2px Abstand = optimale Displayauslastung
+
+TIMING & NICHT-BLOCKIERENDES DESIGN:
+================================================================================
+Das gesamte System arbeitet mit striktem Non-Blocking-Design:
+
+  • Loop-Frequenz:            ~1000-2000 Hz (unkritisch, kein delay())
+  • Spektrum-Leseintervall:   SPECTRUM_INTERVAL_MS = 10ms
+  • Display-Aktualisierung:   Gekoppelt an Spektrum (~100 FPS)
+  • Debug-Ausgaben:           DEBUG_INTERVAL_MS = 2000ms
+  • Stream-Timeout:           STREAM_TIMEOUT_MS = 12000ms
+  • WiFi-Reconnect-Verzögerung: RECONNECT_DELAY_MS = 5000ms
+
+Blockade-freie Stream-Aufnahme:
+  - Nur max. 10 MP3-Daten-Chunks pro loop() aufgelesen
+  - Verhindert UI-Einfrierung
+  - MP3buff (32 Bytes) puffert zwischen Netzwerk und VS1053
+
+FEHLERHAFT-HANDLING & ROBUSTHEIT:
+================================================================================
+1. VS1053 Init:     10 Versuche mit HW-Reset + Chip-Version Verifikation
+2. Plugin-Laden:    Mit Verzögerung, Adress-Erkennung im Betrieb
+3. WiFi-Rekonnect: Automatisch bei Verbindungsverlust (10s Timeout)
+4. Stream-Reconnect: Watchdog bei 12s Datenstille, VS1053-Reset, Neustart
+5. Display-Fehler:  Graceful Degradation (displayReady Flag)
+
+DATENFLUSS-DIAGRAMM:
+================================================================================
+
+        [Eruption Radio UK Server]
+                  ↓ (HTTP Stream)
+        [WiFi → ESP32 TCP Client]
+                  ↓ (32-Byte Chunks)
+        [VS1053 MP3 Decoder]
+                  ├→ [Audio-Ausgang]
+                  └→ [FFT Spectrum Analyzer (DSP)]
+                       ↓ (Band-Daten @ 0x1802/0x1812)
+                  [ESP32 WRAM-Leser]
+                       ↓
+                  [Kinetische Peak-Animation]
+                       ↓
+        [SSD1306 OLED Renderer]
+
+VERWENDETE REGISTER & ADRESSEN:
+================================================================================
+  SCI_WRAMADDR (0x07):    Setzt Lese-Adresse im VS1053 WRAM
+  SCI_WRAM (0x06):        Liest 16-Bit Daten vom WRAM
+  0x1802/0x1804:          FFT-Plugin Standardaddressen (14 Bänder)
+  0x1812/0x1824:          FFT-Plugin Alternative (14 Bänder)
+
+FFT-Daten-Format pro Band (16-Bit):
+  Bits 0-5:   current   (0-63 → 0-31 nach Normalisierung)
+  Bits 6-11:  peak      (0-63 → 0-31 nach Normalisierung)
+  Bits 12-15: reserved
+
+DYNAMISCHES GAIN-SYSTEM (drawSpectrum):
+================================================================================
+Das Menschliche Ohr nimmt Höhen schwächer wahr als Tiefen. Das Plugin
+liefert ebenfalls schwächere Höhen. Daher adaptive Schwellenwerte pro Band:
+
+  Band 0-1 (Sub-Bass):     currentGain = 24.0
+  Band 2-4 (Bass/Mitten):  currentGain = 20.0
+  Band 5-6 (Ob.-Mitten):   currentGain = 16.0
+  Band 7 (Präsenz):        currentGain = 12.0
+  Band 8-9 (Höhen):        currentGain = 10.0
+
+Dies erzeugt eine "ausgeglichene" visuelle Darstellung auch bei Streaming.
+
+PEAK-HOLD & GRAVITY-ANIMATION:
+================================================================================
+Jeder Peak merkt sich die höchste erreichtePosition und fällt dann
+sanft nach unten mit Gravitationsbeschleunigung:
+
+  1. Wenn neue Bar > Peak:  Peak = new, Gravity = 0 (instant)
+  2. Sonst:                 Gravity += 0.40; Peak -= Gravity
+  3. Smooth Falloff → Auge verfolgt die Animation besser
+
+=> "Laser-Peak" visuell über der Bar sichtbar
+
+INITIALISIERUNGS-SEQUENZ:
+================================================================================
+setup():
+  1. Serial @ 115200 Baud + System-Info (CPU MHz, Free Heap)
+  2. VS1053 Zuverlässige Init (10x mit HW-Reset)
+     → Halt wenn fehlgeschlagen
+  3. Spectrum Analyzer Plugin laden
+  4. OLED Init & "VS1053 OK" Message
+  5. WiFi-Verbindung zu SSID/Pass (aus cred.h)
+  6. Stream-Verbindung zu Eruption Radio UK
+
+loop():
+  • Alle 10ms:    readSpectrum() + drawSpectrum()
+  • Alle 2sec:    Debug-Output (aktuell deaktiviert)
+  • Kontinuierlich: readStreamToVS1053(), WiFi-Maintenance, Reconnect-Check
+
+SICHERHEITSMERKMALE:
+================================================================================
+• Status-Flags:         vs1053Ready, pluginReady, displayReady, streamReady
+• Timeout-Watchdogs:    12s Stream-Timeout, 5s Reconnect-Verzögerung
+• Register-Verifikation: Chip-Version = 4 erforderlich
+• Adress-Dynamik:       Bandadresse wird zur Laufzeit erkannt
+• Max-Chunks-Limiting:   10er Loop-Limit gegen Blockade
+
+KONFIGURIERBARE PARAMETER:
+================================================================================
+Oben in der Datei (Defines):
+  - USE_DISPLAY:          1=OLED aktiv, 0=OLED aus
+  - VOLUME:               72 (0-255)
+  - STREAM_TIMEOUT_MS:    12000
+  - RECONNECT_DELAY_MS:   5000
+  - MAX_BANDS:            14
+
+Externe Konfiguration (cred.h):
+  - ssid:                 WiFi SSID
+  - pass:                 WiFi Passwort
+
+ABHÄNGIGKEITEN:
+================================================================================
+  • VS1053:               VS1053 Library (SPI-Decoder-Steuerung)
+  • WiFi:                 ESP32 WiFi Core
+  • Wire:                 I2C für OLED
+  • Adafruit_SSD1306:     OLED-Display-Treiber
+  • Adafruit_GFX:         Grafikprimitiven (drawRect, drawLine)
+  • spectrumAnalyzer1053b.h: Binary Plugin Code (DSP-Firmware)
+
+DEBUGGING & TROUBLESHOOTING:
+================================================================================
+Serial Monitor (115200 Baud) zeigt:
+  [VS1053]:  Hardware-Status
+  [PLUGIN]:  FFT-Plugin Erkennungsergebnisse
+  [OLED]:    Display-Status
+  [WIFI]:    Verbindungsstatus
+  [STREAM]:  Streaming-Fehler und Reconnects
+  [SPEC]:    Spektrum-Daten (Debug-Mode)
+
+Performance:
+  • CPU-Auslastung: ~40-60% (MP3-Decode + FFT + OLED-Rendering)
+  • Free Heap: Typisch 180-220 KB (von ~320 KB)
+  • Keine unkontrollierten Speicherlecks
+
+================================================================================
+Autor:              DE8MSH
+Projekt-Typ:        Internet Radio Streamer + Echtzeit-Spektrumvisualisierung
+Komplexität:        Fortgeschritten (Embedded Linux, DSP, Hardware-Integration)
+Letzte Änderung:    Dynamic Fix 2 (Stabile Init & Blockade-freier Stream)
+================================================================================
+*/
+
+
 #include <SPI.h>
 #include <VS1053.h>
 #include <WiFi.h>
