@@ -402,16 +402,16 @@ void drawSpectrum() {
   int gap = 2;
   int startX = 0;
 
+  // 1. ZUERST DIE BALKEN ZEICHNEN
   for (uint8_t i = 0; i < 10; i++) {
     if (i >= bandCount) break; 
 
-    // 1. Gain-System
-    float currentGain = 24.0;
-    if (i == 0 || i == 1) currentGain = 24.0; 
-    else if (i <= 4)      currentGain = 22.0; 
-    else if (i <= 6)      currentGain = 20.0; 
-    else if (i == 7)      currentGain = 18.0; 
-    else                  currentGain = 16.0; 
+    float currentGain = 22.0;
+    if (i == 0 || i == 1) currentGain = 22.0; 
+    else if (i <= 4)      currentGain = 20.0; 
+    else if (i <= 6)      currentGain = 18.0; 
+    else if (i == 7)      currentGain = 16.0; 
+    else                  currentGain = 14.0; 
 
     int halfBarH = map(constrain(spectrum[i], 0, currentGain), 0, currentGain, 0, maxHalfHeight);
     int x = startX + (i * (barWidth + gap));
@@ -420,66 +420,29 @@ void drawSpectrum() {
       int yTop = centerY - halfBarH;
       int yBottom = centerY + halfBarH;
 
-      // 2. DAS INTELLIGENTE 8-STUFEN-RASTER
-      
-      // STUFE 8: 100% – Vollweiß (Ab 28 Pixel Höhe)
-      if (halfBarH >= 28) {
+      // 5-Stufen-Raster
+      if (halfBarH >= 25) {
         display.fillRect(x, yTop, barWidth, halfBarH * 2, SSD1306_WHITE);
       }
-      
-      // STUFE 7: 87.5% – Fast voll
-      else if (halfBarH >= 24) {
-        for (int py = yTop; py <= yBottom; py++) {
-          for (int px = x; px < x + barWidth; px++) {
-            if ((px * 3 + py) % 8 != 0) display.drawPixel(px, py, SSD1306_WHITE);
-          }
-        }
-      }
-      
-      // STUFE 6: 75% – Dichtes Schachbrett
-      else if (halfBarH >= 20) {
+      else if (halfBarH >= 19) {
         for (int py = yTop; py <= yBottom; py++) {
           for (int px = x; px < x + barWidth; px++) {
             if ((px + py) % 4 != 0) display.drawPixel(px, py, SSD1306_WHITE);
           }
         }
       }
-      
-      // STUFE 5: 62.5% – Engmaschig
-      else if (halfBarH >= 16) {
-        for (int py = yTop; py <= yBottom; py++) {
-          for (int px = x; px < x + barWidth; px++) {
-            if (((px + py) % 2 == 0) || (py % 4 == 0)) display.drawPixel(px, py, SSD1306_WHITE);
-          }
-        }
-      }
-      
-      // STUFE 4: 50% – Horizontale Linien
-      else if (halfBarH >= 12) {
+      else if (halfBarH >= 13) {
         for (int py = yTop; py <= yBottom; py++) {
           if (py % 2 == 0) display.drawFastHLine(x, py, barWidth, SSD1306_WHITE);
         }
       }
-      
-      // STUFE 3: 37.5% – Offenes Muster
-      else if (halfBarH >= 8) {
-        for (int py = yTop; py <= yBottom; py++) {
-          for (int px = x; px < x + barWidth; px++) {
-            if ((px * 2 + py) % 3 == 0) display.drawPixel(px, py, SSD1306_WHITE);
-          }
-        }
-      }
-      
-      // STUFE 2: 25% – Feines Punktgitter
-      else if (halfBarH >= 4) {
+      else if (halfBarH >= 7) {
         for (int py = yTop; py <= yBottom; py++) {
           for (int px = x; px < x + barWidth; px++) {
             if (px % 2 == 0 && py % 2 == 0) display.drawPixel(px, py, SSD1306_WHITE);
           }
         }
       }
-      
-      // STUFE 1: 12.5% – Hauchdünner Schein (1 bis 3 Pixel Höhe)
       else {
         for (int py = yTop; py <= yBottom; py++) {
           for (int px = x; px < x + barWidth; px++) {
@@ -487,11 +450,64 @@ void drawSpectrum() {
           }
         }
       }
-
     } else {
-      // K.I.T.T.-Mittellinie bei absolutem Schweigen
       display.drawFastHLine(x, centerY, barWidth, SSD1306_WHITE);
     }
+  }
+
+  // 2. JETZT DEN FETTEN HALBSINUS-HÜPFENDEN TEXT DARÜBERSTANZEN
+  static int scrollX = 128; 
+  static unsigned long lastScroll = 0;
+  static float angleOffset = 0; // Bestimmt die Wellenbewegung über die Zeit
+  
+  const char* tickerText = "E R U P T I O N   R A D I O   U K           "; 
+  int textLength = strlen(tickerText);
+
+  display.setTextSize(3);
+  display.setTextColor(SSD1306_BLACK); // Ausstanzen
+  display.setTextWrap(false);
+
+  int currentX = scrollX;
+
+  // Wir müssen jeden Buchstaben einzeln zeichnen, damit er ein eigenes Y bekommt
+  for (int charIdx = 0; charIdx < textLength; charIdx++) {
+    char c = tickerText[charIdx];
+
+    // Nur zeichnen, wenn der Buchstabe im sichtbaren Bereich ist
+    if (currentX >= -6 && currentX < 128) {
+      
+      // Berechne den Sinus-Winkel für DIESEN spezifischen Buchstaben
+      // charIdx * 0.5 sorgt für den Phasenversatz (jeder Buchstabe ist an einer anderen Stelle der Welle)
+      float angle = angleOffset + (charIdx * 0.1);
+      
+      // abs(sin()) erzeugt die harte "Bounce"-Kurve eines springenden Balls (Halbsinus)
+      // Der Buchstabe hüpft bis zu 12 Pixel weit nach oben aus der Mitte heraus
+      int yOffset = abs(sin(angle)) * 12; 
+      int targetY = 28 - yOffset; // Von der Mittellinie (28) nach oben abziehen
+
+      // --- DER TRICK FÜR FETTSCHRIFT ---
+      // Buchstabe 1 zeichnen
+      display.setCursor(currentX, targetY);
+      display.print(c);
+      // Buchstabe 2 minimal versetzt zeichnen -> macht es fett!
+      display.setCursor(currentX + 1, targetY);
+      display.print(c);
+
+    }
+    
+    // Abstand zum nächsten Zeichen (Fette Schrift braucht 1px mehr Platz)
+    currentX += 9; 
+  }
+
+  // Ticker-Geschwindigkeit und Animations-Takt
+  if (millis() - lastScroll >= 25) {
+    scrollX--; // Text wandert nach links
+    angleOffset += 0.15; // Erhöht die Geschwindigkeit des Hüpfens
+    
+    if (scrollX < -(textLength * 7)) { 
+      scrollX = 128; 
+    }
+    lastScroll = millis();
   }
 
   display.display();
