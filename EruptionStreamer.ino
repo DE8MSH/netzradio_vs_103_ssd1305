@@ -1,12 +1,15 @@
 #include <SPI.h>
 #include <VS1053.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
 #include "cred.h"
 #include "spectrumAnalyzer1053b.h"
+#include "radio_bitmap.h"
 
 // ------------------------------------------------------------
 // Display
@@ -49,6 +52,20 @@
 #define DEBUG_INTERVAL_MS 2000
 #define STREAM_TIMEOUT_MS 12000
 #define RECONNECT_DELAY_MS 5000
+#define SCHEDULE_REFRESH_MS 300000UL
+
+// ------------------------------------------------------------
+// Boot-Zoom-Stufen fuer das Startbild
+// ------------------------------------------------------------
+#define BOOT_STAGE_POWER_ON       0
+#define BOOT_STAGE_SYSTEM_INFO    1
+#define BOOT_STAGE_VS1053_OK      2
+#define BOOT_STAGE_PLUGIN_OK      3
+#define BOOT_STAGE_WIFI_START     4
+#define BOOT_STAGE_WIFI_OK        5
+#define BOOT_STAGE_STREAM_TCP     6
+#define BOOT_STAGE_STREAM_HEADERS 7
+#define BOOT_STAGE_STREAM_READY   8
 
 // ------------------------------------------------------------
 // VS1053 SCI Register
@@ -72,6 +89,15 @@ const char* STREAM_PATH = "/stream";
 const uint16_t STREAM_PORT = 8116;
 
 // ------------------------------------------------------------
+// Eruption Radio UK Schedule API
+// ------------------------------------------------------------
+const char* SCHEDULE_URL = "https://api.eruptionradio.uk/schedule/now";
+const char* EDGE_WIN11_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+  "AppleWebKit/537.36 (KHTML, like Gecko) "
+  "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.2478.80";
+
+// ------------------------------------------------------------
 // Objekte
 // ------------------------------------------------------------
 VS1053 player(VS1053_CS, VS1053_DCS, VS1053_DREQ);
@@ -91,6 +117,9 @@ bool vs1053Ready = false;
 bool pluginReady = false;
 bool displayReady = false;
 bool streamReady = false;
+bool startupImageVisible = false;
+bool musicStarted = false;
+uint8_t startupBootStage = BOOT_STAGE_POWER_ON;
 
 unsigned long lastDataTime = 0;
 unsigned long lastReconnectAttempt = 0;
@@ -102,9 +131,15 @@ unsigned long dotTimer = 0;
 // DYNAMISCHE METADATEN SPEICHER
 // ------------------------------------------------------------
 String stationName = "Loading...";
-String streamTitle = "E R U P T I O N   R A D I O   U K           "; // Fallback
+String streamTitle = "E R U P T I O N   R A D I O   U K           "; // Text fuer OLED-Scroller
+String currentSongTitle = "";
+String currentShowTime = "";
+String currentShowTitle = "";
+String currentPresenterName = "";
+String currentGenres = "";
 int metaInterval = 0;          // Wert aus 'icy-metaint'
 int byteCounter = 0;           // Zählt gelesene Audio-Bytes bis zur nächsten Meta-Info
+unsigned long lastScheduleFetch = 0;
 
 // Vorwärtsdeklarationen
 void printSystemInfo();
@@ -112,7 +147,15 @@ bool initVS1053Reliable();
 bool loadSpectrumPluginReliable();
 void initDisplay();
 void showMessage(const char* msg);
+void showStartupImage();
+void setStartupBootStage(uint8_t stage);
+void hideStartupImageWhenMusicStarts();
 void connectToWiFi();
+bool fetchScheduleNow();
+void updateScheduleIfDue();
+String jsonStringValue(const String& json, const char* key);
+String cleanJsonText(String value);
+void updateScrollerText();
 void connectToStream();
 void maintainWiFi();
 void readStreamToVS1053();
@@ -126,7 +169,14 @@ void drawSpectrum();
 // ------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(250);
+
+#if USE_DISPLAY
+  // OLED so frueh wie moeglich starten: Das Bild erscheint vor allen
+  // anderen Init-Schritten und bleibt bis zum ersten Audiopaket sichtbar.
+  initDisplay();
+  showStartupImage();
+#endif
 
   Serial.println();
   Serial.println("=======================================");
@@ -135,18 +185,16 @@ void setup() {
   Serial.println();
 
   printSystemInfo();
+  setStartupBootStage(BOOT_STAGE_SYSTEM_INFO);
 
   if (!initVS1053Reliable()) {
     Serial.println("[STOP] VS1053 konnte nicht initialisiert werden.");
     while (true) { delay(1000); }
   }
+  setStartupBootStage(BOOT_STAGE_VS1053_OK);
 
   pluginReady = loadSpectrumPluginReliable();
-
-#if USE_DISPLAY
-  initDisplay();
-  showMessage("VS1053 OK");
-#endif
+  setStartupBootStage(BOOT_STAGE_PLUGIN_OK);
 
   connectToWiFi();
   connectToStream();
@@ -157,6 +205,7 @@ void setup() {
 // ------------------------------------------------------------
 void loop() {
   maintainWiFi();
+  updateScheduleIfDue();
   readStreamToVS1053();
 
   if (millis() - lastSpectrumRead > SPECTRUM_INTERVAL_MS) {
@@ -327,13 +376,13 @@ void initDisplay() {
     return;
   }
   displayReady = true;
-  showMessage("Boot OK");
 #endif
 }
 
 void showMessage(const char* msg) {
 #if USE_DISPLAY
   if (!displayReady) return;
+  if (startupImageVisible && !musicStarted) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -345,10 +394,47 @@ void showMessage(const char* msg) {
   display.display();
 #endif
 }
+void showStartupImage() {
+#if USE_DISPLAY
+  if (!displayReady) return;
+  startupBootStage = BOOT_STAGE_POWER_ON;
+  drawStartupImageBootStage(display, startupBootStage);
+  startupImageVisible = true;
+  musicStarted = false;
+#endif
+}
+
+void setStartupBootStage(uint8_t stage) {
+#if USE_DISPLAY
+  if (!displayReady || !startupImageVisible || musicStarted) return;
+  if (stage > STARTUP_IMAGE_BOOT_STAGES) stage = STARTUP_IMAGE_BOOT_STAGES;
+  if (stage < startupBootStage) return;
+
+  startupBootStage = stage;
+  drawStartupImageBootStage(display, startupBootStage);
+#endif
+}
+
+void hideStartupImageWhenMusicStarts() {
+#if USE_DISPLAY
+  if (!displayReady || !startupImageVisible) return;
+
+  // Letzte 10% Zoom-Out erst dann, wenn wirklich Musikdaten kommen.
+  setStartupBootStage(BOOT_STAGE_STREAM_READY);
+  drawStartupImageZoom(display, STARTUP_IMAGE_SCALE_FINAL);
+  delay(80);
+
+  startupImageVisible = false;
+  musicStarted = true;
+  display.clearDisplay();
+  display.display();
+#endif
+}
 
 void drawSpectrum() {
 #if USE_DISPLAY
   if (!displayReady || !pluginReady || spectrumBandsAddr == 0 || bandCount == 0) return;
+  if (startupImageVisible && !musicStarted) return;
 
   display.clearDisplay();
 
@@ -457,6 +543,7 @@ void drawSpectrum() {
 // ------------------------------------------------------------
 void connectToWiFi() {
   Serial.println("[WIFI] Verbinde...");
+  setStartupBootStage(BOOT_STAGE_WIFI_START);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.disconnect(true);
@@ -477,7 +564,11 @@ void connectToWiFi() {
     return;
   }
   stationName = "WiFi Connected";
+  setStartupBootStage(BOOT_STAGE_WIFI_OK);
   showMessage("OK");
+
+  // Aktuelle Eruption-Show holen, bevor der Audiostream startet.
+  fetchScheduleNow();
 }
 
 void maintainWiFi() {
@@ -495,7 +586,142 @@ void maintainWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    fetchScheduleNow();
     connectToStream();
+  }
+}
+
+
+// ------------------------------------------------------------
+// Eruption Schedule API -> OLED Scroller
+// ------------------------------------------------------------
+String cleanJsonText(String value) {
+  value.replace("\\/", "/");
+  value.replace("\\\"", "\"");
+  value.replace("\\n", " ");
+  value.replace("\\r", " ");
+  value.replace("\\t", " ");
+  value.trim();
+  return value;
+}
+
+String jsonStringValue(const String& json, const char* key) {
+  String needle = String("\"") + key + "\":\"";
+  int start = json.indexOf(needle);
+  if (start < 0) return "";
+  start += needle.length();
+
+  String value = "";
+  bool escaped = false;
+  for (int i = start; i < json.length(); i++) {
+    char c = json.charAt(i);
+    if (escaped) {
+      value += '\\';
+      value += c;
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') break;
+    value += c;
+  }
+  return cleanJsonText(value);
+}
+
+void updateScrollerText() {
+  String text = "";
+
+  if (currentShowTime.length() > 0) {
+    //text += "SHOWTIME: ";
+    text += currentShowTime;
+  }
+  if (currentShowTitle.length() > 0) {
+    if (text.length() > 0) text += "   |   ";
+    //text += "SHOW: ";
+    text += currentShowTitle;
+  }
+  if (currentPresenterName.length() > 0 && currentPresenterName != currentShowTitle) {
+    if (text.length() > 0) text += "-";
+    //text += "NAME: ";
+    text += currentPresenterName;
+  }
+  if (currentGenres.length() > 0) {
+    if (text.length() > 0) text += "-";
+    text += "GENRE: ";
+    text += currentGenres;
+  }
+  if (currentSongTitle.length() > 0) {
+    if (text.length() > 0) text += "-";
+    text += "NOW PLAYING: ";
+    text += currentSongTitle;
+  }
+
+  if (text.length() == 0) text = "E R U P T I O N   R A D I O   U K";
+  streamTitle = text + " reload ";
+}
+
+bool fetchScheduleNow() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  Serial.println("[SCHEDULE] Hole aktuelle Show...");
+  lastScheduleFetch = millis();
+
+  WiFiClientSecure scheduleClient;
+  scheduleClient.setInsecure(); // API per HTTPS, ohne Zertifikatsbundle auf dem ESP32
+
+  HTTPClient http;
+  http.setUserAgent(EDGE_WIN11_USER_AGENT);
+  http.setTimeout(6000);
+
+  if (!http.begin(scheduleClient, SCHEDULE_URL)) {
+    Serial.println("[SCHEDULE] HTTP begin fehlgeschlagen.");
+    return false;
+  }
+
+  http.addHeader("Accept", "application/json, text/plain, */*");
+  http.addHeader("Accept-Language", "en-GB,en;q=0.9,de;q=0.8");
+  http.addHeader("Cache-Control", "no-cache");
+  http.addHeader("Pragma", "no-cache");
+  http.addHeader("Connection", "close");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.print("[SCHEDULE] HTTP Fehler: ");
+    Serial.println(code);
+    http.end();
+    return false;
+  }
+
+  String json = http.getString();
+  http.end();
+
+  currentShowTime = jsonStringValue(json, "show_time");
+  currentShowTitle = jsonStringValue(json, "show");
+  currentPresenterName = jsonStringValue(json, "name");
+  currentGenres = jsonStringValue(json, "genres");
+
+  updateScrollerText();
+
+  Serial.print("[SCHEDULE] Showtime: ");
+  Serial.println(currentShowTime);
+  Serial.print("[SCHEDULE] Show: ");
+  Serial.println(currentShowTitle);
+  Serial.print("[SCHEDULE] Name: ");
+  Serial.println(currentPresenterName);
+  Serial.print("[SCHEDULE] Genre: ");
+  Serial.println(currentGenres);
+
+  return true;
+}
+
+void updateScheduleIfDue() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (lastScheduleFetch == 0) return;
+  if (millis() - lastScheduleFetch >= SCHEDULE_REFRESH_MS) {
+    fetchScheduleNow();
   }
 }
 
@@ -517,10 +743,12 @@ void connectToStream() {
     streamReady = false;
     return;
   }
+  setStartupBootStage(BOOT_STAGE_STREAM_TCP);
 
   client.print(String("GET ") + STREAM_PATH + " HTTP/1.0\r\n" +
                "Host: " + STREAM_HOST + "\r\n" +
-               "User-Agent: ESP32-VS1053-Radio\r\n" +
+               "User-Agent: " + EDGE_WIN11_USER_AGENT + "\r\n" +
+               "Accept: */*\r\n" +
                "Icy-MetaData: 1\r\n" + 
                "Connection: close\r\n\r\n");
 
@@ -531,8 +759,11 @@ void connectToStream() {
     return;
   }
 
+  setStartupBootStage(BOOT_STAGE_STREAM_HEADERS);
+
   Serial.println("[STREAM] Datenstrom laeuft.");
   streamReady = true;
+  setStartupBootStage(BOOT_STAGE_STREAM_READY);
   byteCounter = 0;
   lastDataTime = millis();
 }
@@ -556,8 +787,10 @@ bool skipAndParseHttpHeaders() {
         Serial.print("[META] Sendername: ");
         Serial.println(stationName);
         
-        // Zwingt den Sendernamen direkt in den Scroller beim Start!
-        streamTitle = stationName + "          "; 
+        // Sendername bleibt als Fallback; der Scroller zeigt die aktuelle Show.
+        if (currentShowTime.length() == 0 && currentShowTitle.length() == 0) {
+          streamTitle = stationName + "          ";
+        }
       }
       
       // Metadaten-Intervall auslesen
@@ -601,10 +834,11 @@ void readStreamToVS1053() {
           int startIdx = metaString.indexOf("StreamTitle='") + 13;
           int endIdx = metaString.indexOf("';", startIdx);
           if (endIdx > startIdx) {
-            streamTitle = metaString.substring(startIdx, endIdx);
-            streamTitle += "      "; 
+            currentSongTitle = metaString.substring(startIdx, endIdx);
+            currentSongTitle.trim();
+            updateScrollerText();
             Serial.print("[META] Songtitel: ");
-            Serial.println(streamTitle);
+            Serial.println(currentSongTitle);
           }
         }
       }
@@ -619,6 +853,9 @@ void readStreamToVS1053() {
     int bytesRead = client.read(mp3buff, bytesToRead);
     if (bytesRead > 0) {
       lastDataTime = millis();
+#if USE_DISPLAY
+      hideStartupImageWhenMusicStarts();
+#endif
       player.playChunk(mp3buff, bytesRead);
       byteCounter += bytesRead;
       chunksProcessed++;
