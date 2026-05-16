@@ -32,13 +32,31 @@
 #define VS1053_RST 27   // RST / XRST / XRESET
 
 // ------------------------------------------------------------
-// OLED SSD1306 I2C
+// OLED SSD1306 / SSD1309 I2C
 // ------------------------------------------------------------
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define OLED_ADDR 0x3C
+
+// Controller-Auswahl:
+// 0 = AUTO: I2C-Test + SSD1309-kompatibles Profil, weil SSD1306/SSD1309
+//     ueber I2C leider keine eindeutige Chip-ID liefern.
+// 1 = SSD1306 erzwingen
+// 2 = SSD1309 erzwingen
+#define OLED_DRIVER_AUTO   0
+#define OLED_DRIVER_SSD1306 1
+#define OLED_DRIVER_SSD1309 2
+#define OLED_DRIVER OLED_DRIVER_AUTO
+
+// Falls dein SSD1309-Modul vertikal versetzt wirkt, hier feinjustieren.
+// Typisch: 0. Bei manchen Clones hilft 1, 2 oder -1.
+#define OLED_DISPLAY_OFFSET_Y 0
+
+// Kontrast getrennt, weil SSD1309 oft heller/anders wirkt als SSD1306.
+#define OLED_CONTRAST_SSD1306 0xCF
+#define OLED_CONTRAST_SSD1309 0x9F
 
 // ------------------------------------------------------------
 // Audio
@@ -66,6 +84,16 @@
 #define BOOT_STAGE_STREAM_TCP     6
 #define BOOT_STAGE_STREAM_HEADERS 7
 #define BOOT_STAGE_STREAM_READY   8
+
+// ------------------------------------------------------------
+// Startup-Ueberblendung: 8x8-Kaestchen zufaellig vom FFT-Bild ersetzen lassen
+// 128x64 => 16 x 8 Tiles = 128 Tiles gesamt
+// ------------------------------------------------------------
+#define STARTUP_TILE_SIZE 8
+#define STARTUP_TILE_COLS (OLED_WIDTH / STARTUP_TILE_SIZE)
+#define STARTUP_TILE_ROWS (OLED_HEIGHT / STARTUP_TILE_SIZE)
+#define STARTUP_TILE_COUNT (STARTUP_TILE_COLS * STARTUP_TILE_ROWS)
+#define STARTUP_TILE_REVEAL_PER_FRAME 4
 
 // ------------------------------------------------------------
 // VS1053 SCI Register
@@ -103,6 +131,7 @@ const char* EDGE_WIN11_USER_AGENT =
 VS1053 player(VS1053_CS, VS1053_DCS, VS1053_DREQ);
 WiFiClient client;
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+uint8_t activeOledDriver = OLED_DRIVER_AUTO;
 
 // ------------------------------------------------------------
 // Buffer / Status
@@ -119,7 +148,11 @@ bool displayReady = false;
 bool streamReady = false;
 bool startupImageVisible = false;
 bool musicStarted = false;
+bool startupTransitionActive = false;
 uint8_t startupBootStage = BOOT_STAGE_POWER_ON;
+uint8_t startupTileOrder[STARTUP_TILE_COUNT];
+bool startupTileRevealed[STARTUP_TILE_COUNT];
+uint16_t startupTilesRevealedCount = 0;
 
 unsigned long lastDataTime = 0;
 unsigned long lastReconnectAttempt = 0;
@@ -146,9 +179,18 @@ void printSystemInfo();
 bool initVS1053Reliable();
 bool loadSpectrumPluginReliable();
 void initDisplay();
+bool i2cDeviceExists(uint8_t addr);
+void applyOledControllerProfile(uint8_t driver);
+const char* oledDriverName(uint8_t driver);
 void showMessage(const char* msg);
 void showStartupImage();
 void setStartupBootStage(uint8_t stage);
+uint8_t startupScaleFromBootStage(uint8_t stage);
+bool startupImageScaledPixelOn(int16_t x, int16_t y, uint8_t scalePercent);
+void initStartupTileTransition();
+void advanceStartupTileTransition();
+void overlayStartupImageTiles(uint8_t scalePercent);
+void renderSpectrumSceneToBuffer();
 void hideStartupImageWhenMusicStarts();
 void connectToWiFi();
 bool fetchScheduleNow();
@@ -368,21 +410,108 @@ void initDisplay() {
 #if USE_DISPLAY
   Serial.println("[OLED] Initialisiere...");
   Wire.begin(OLED_SDA, OLED_SCL);
-  delay(100);
+  Wire.setClock(400000);
+  delay(50);
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("[OLED] FEHLER: SSD1306 nicht gefunden.");
+  if (!i2cDeviceExists(OLED_ADDR)) {
+    Serial.print("[OLED] FEHLER: Kein OLED auf I2C-Adresse 0x");
+    Serial.println(OLED_ADDR, HEX);
     displayReady = false;
     return;
   }
+
+  // Wichtig: SSD1306 und SSD1309 melden ueber I2C keine verlaessliche ID.
+  // Deshalb wird zuerst elektrisch getestet, dann ein Controller-Profil gesetzt.
+#if OLED_DRIVER == OLED_DRIVER_SSD1306
+  activeOledDriver = OLED_DRIVER_SSD1306;
+#elif OLED_DRIVER == OLED_DRIVER_SSD1309
+  activeOledDriver = OLED_DRIVER_SSD1309;
+#else
+  activeOledDriver = OLED_DRIVER_SSD1309; // AUTO: SSD1309-kompatibel, laeuft i.d.R. auch auf SSD1306
+#endif
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("[OLED] FEHLER: Display-Lib konnte nicht starten.");
+    displayReady = false;
+    return;
+  }
+
+  applyOledControllerProfile(activeOledDriver);
   displayReady = true;
+
+  Serial.print("[OLED] I2C OK, Profil: ");
+  Serial.println(oledDriverName(activeOledDriver));
+#endif
+}
+
+bool i2cDeviceExists(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return (Wire.endTransmission() == 0);
+}
+
+const char* oledDriverName(uint8_t driver) {
+  if (driver == OLED_DRIVER_SSD1306) return "SSD1306";
+  if (driver == OLED_DRIVER_SSD1309) return "SSD1309";
+  return "AUTO";
+}
+
+void applyOledControllerProfile(uint8_t driver) {
+#if USE_DISPLAY
+  // Controller-Kommandos. Die meisten sind bei SSD1306 und SSD1309 gleich,
+  // aber Kontrast/VCOM/Precharge und Display-Offset unterscheiden sich oft
+  // sichtbar bei 2.42-Zoll-SSD1309-Modulen.
+  display.ssd1306_command(0xAE); // display off
+  display.ssd1306_command(0xD5); display.ssd1306_command(0x80); // clock
+  display.ssd1306_command(0xA8); display.ssd1306_command(0x3F); // multiplex 64
+  display.ssd1306_command(0xD3); display.ssd1306_command((uint8_t)OLED_DISPLAY_OFFSET_Y);
+  display.ssd1306_command(0x40); // start line 0
+  display.ssd1306_command(0x20); display.ssd1306_command(0x00); // horizontal addressing
+  display.ssd1306_command(0xA1); // segment remap
+  display.ssd1306_command(0xC8); // COM scan dec
+  display.ssd1306_command(0xDA); display.ssd1306_command(0x12); // COM pins
+
+  if (driver == OLED_DRIVER_SSD1309) {
+    display.ssd1306_command(0x81); display.ssd1306_command(OLED_CONTRAST_SSD1309);
+    display.ssd1306_command(0xD9); display.ssd1306_command(0xF1);
+    display.ssd1306_command(0xDB); display.ssd1306_command(0x40);
+  } else {
+    display.ssd1306_command(0x81); display.ssd1306_command(OLED_CONTRAST_SSD1306);
+    display.ssd1306_command(0xD9); display.ssd1306_command(0xF1);
+    display.ssd1306_command(0xDB); display.ssd1306_command(0x40);
+  }
+
+  display.ssd1306_command(0x8D); display.ssd1306_command(0x14); // charge pump
+  display.ssd1306_command(0xA4); // display follows RAM
+  display.ssd1306_command(0xA6); // normal display
+  display.ssd1306_command(0x2E); // deactivate scroll
+  display.ssd1306_command(0xAF); // display on
+  display.clearDisplay();
+  display.display();
+#endif
+}
+
+void drawSpectrum() {
+#if USE_DISPLAY
+  if (!displayReady || !pluginReady || spectrumBandsAddr == 0 || bandCount == 0) return;
+  if (startupImageVisible && !musicStarted) return;
+
+  if (startupTransitionActive) {
+    advanceStartupTileTransition();
+    renderSpectrumSceneToBuffer();
+    overlayStartupImageTiles(100);
+    display.display();
+    return;
+  }
+
+  renderSpectrumSceneToBuffer();
+  display.display();
 #endif
 }
 
 void showMessage(const char* msg) {
 #if USE_DISPLAY
   if (!displayReady) return;
-  if (startupImageVisible && !musicStarted) return;
+  if ((startupImageVisible && !musicStarted) || startupTransitionActive) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -394,48 +523,115 @@ void showMessage(const char* msg) {
   display.display();
 #endif
 }
+uint8_t startupScaleFromBootStage(uint8_t stage) {
+  if (stage > STARTUP_IMAGE_BOOT_STAGES) stage = STARTUP_IMAGE_BOOT_STAGES;
+  uint8_t scale = 10 + (stage * 10);
+  if (scale > 90) scale = 90;
+  return scale;
+}
+
+bool startupImageScaledPixelOn(int16_t x, int16_t y, uint8_t scalePercent) {
+  const int16_t srcCx = STARTUP_IMAGE_WIDTH / 2;
+  const int16_t srcCy = STARTUP_IMAGE_HEIGHT / 2;
+  const int16_t dstCx = STARTUP_IMAGE_WIDTH / 2;
+  const int16_t dstCy = STARTUP_IMAGE_HEIGHT / 2;
+
+  int16_t sx = srcCx + ((int32_t)(x - dstCx) * 100L) / scalePercent;
+  int16_t sy = srcCy + ((int32_t)(y - dstCy) * 100L) / scalePercent;
+  return startupImageGetPixel(sx, sy);
+}
+
+void initStartupTileTransition() {
+  for (uint16_t i = 0; i < STARTUP_TILE_COUNT; i++) {
+    startupTileOrder[i] = i;
+    startupTileRevealed[i] = false;
+  }
+  startupTilesRevealedCount = 0;
+
+  randomSeed((uint32_t)micros() ^ (uint32_t)millis());
+  for (int i = STARTUP_TILE_COUNT - 1; i > 0; i--) {
+    int j = random(i + 1);
+    uint8_t tmp = startupTileOrder[i];
+    startupTileOrder[i] = startupTileOrder[j];
+    startupTileOrder[j] = tmp;
+  }
+}
+
+void advanceStartupTileTransition() {
+  if (!startupTransitionActive) return;
+
+  for (uint8_t i = 0; i < STARTUP_TILE_REVEAL_PER_FRAME; i++) {
+    if (startupTilesRevealedCount >= STARTUP_TILE_COUNT) break;
+    uint8_t tileIndex = startupTileOrder[startupTilesRevealedCount];
+    startupTileRevealed[tileIndex] = true;
+    startupTilesRevealedCount++;
+  }
+
+  if (startupTilesRevealedCount >= STARTUP_TILE_COUNT) {
+    startupTransitionActive = false;
+    startupImageVisible = false;
+  }
+}
+
+void overlayStartupImageTiles(uint8_t scalePercent) {
+  for (uint16_t tileIndex = 0; tileIndex < STARTUP_TILE_COUNT; tileIndex++) {
+    if (startupTileRevealed[tileIndex]) continue;
+
+    int16_t tileX = (tileIndex % STARTUP_TILE_COLS) * STARTUP_TILE_SIZE;
+    int16_t tileY = (tileIndex / STARTUP_TILE_COLS) * STARTUP_TILE_SIZE;
+
+    display.fillRect(tileX, tileY, STARTUP_TILE_SIZE, STARTUP_TILE_SIZE, SSD1306_BLACK);
+
+    for (int16_t py = tileY; py < tileY + STARTUP_TILE_SIZE; py++) {
+      for (int16_t px = tileX; px < tileX + STARTUP_TILE_SIZE; px++) {
+        if (startupImageScaledPixelOn(px, py, scalePercent)) {
+          display.drawPixel(px, py, SSD1306_WHITE);
+        }
+      }
+    }
+  }
+}
+
 void showStartupImage() {
 #if USE_DISPLAY
   if (!displayReady) return;
   startupBootStage = BOOT_STAGE_POWER_ON;
-  drawStartupImageBootStage(display, startupBootStage);
   startupImageVisible = true;
+  startupTransitionActive = false;
   musicStarted = false;
+  startupTilesRevealedCount = 0;
+  memset(startupTileRevealed, 0, sizeof(startupTileRevealed));
+  drawStartupImageZoom(display, startupScaleFromBootStage(startupBootStage));
 #endif
 }
 
 void setStartupBootStage(uint8_t stage) {
 #if USE_DISPLAY
-  if (!displayReady || !startupImageVisible || musicStarted) return;
+  if (!displayReady || !startupImageVisible || musicStarted || startupTransitionActive) return;
   if (stage > STARTUP_IMAGE_BOOT_STAGES) stage = STARTUP_IMAGE_BOOT_STAGES;
   if (stage < startupBootStage) return;
 
   startupBootStage = stage;
-  drawStartupImageBootStage(display, startupBootStage);
+  drawStartupImageZoom(display, startupScaleFromBootStage(startupBootStage));
 #endif
 }
 
 void hideStartupImageWhenMusicStarts() {
 #if USE_DISPLAY
-  if (!displayReady || !startupImageVisible) return;
+  if (!displayReady || !startupImageVisible || startupTransitionActive) return;
 
-  // Letzte 10% Zoom-Out erst dann, wenn wirklich Musikdaten kommen.
-  setStartupBootStage(BOOT_STAGE_STREAM_READY);
-  drawStartupImageZoom(display, STARTUP_IMAGE_SCALE_FINAL);
-  delay(80);
-
-  startupImageVisible = false;
+  // Umgekehrter Zoom: beim ersten echten Audiopaket wird erst auf 100% gezoomt,
+  // danach ersetzt ein zufaelliger 8x8-Kachelmix das Startbild nach und nach
+  // durch den bereits aktiven FFT-Screen.
   musicStarted = true;
-  display.clearDisplay();
-  display.display();
+  startupBootStage = BOOT_STAGE_STREAM_READY;
+  drawStartupImageZoom(display, 100);
+  initStartupTileTransition();
+  startupTransitionActive = true;
 #endif
 }
 
-void drawSpectrum() {
-#if USE_DISPLAY
-  if (!displayReady || !pluginReady || spectrumBandsAddr == 0 || bandCount == 0) return;
-  if (startupImageVisible && !musicStarted) return;
-
+void renderSpectrumSceneToBuffer() {
   display.clearDisplay();
 
   int centerY = 32;
@@ -533,9 +729,6 @@ void drawSpectrum() {
     }
     lastScroll = millis();
   }
-
-  display.display();
-#endif
 }
 
 // ------------------------------------------------------------
@@ -635,32 +828,28 @@ void updateScrollerText() {
   String text = "";
 
   if (currentShowTime.length() > 0) {
-    //text += "SHOWTIME: ";
     text += currentShowTime;
   }
   if (currentShowTitle.length() > 0) {
-    if (text.length() > 0) text += "   |   ";
-    //text += "SHOW: ";
+    if (text.length() > 0) text += "  ";
     text += currentShowTitle;
   }
   if (currentPresenterName.length() > 0 && currentPresenterName != currentShowTitle) {
-    if (text.length() > 0) text += "-";
-    //text += "NAME: ";
+    if (text.length() > 0) text += "  ";
     text += currentPresenterName;
   }
   if (currentGenres.length() > 0) {
-    if (text.length() > 0) text += "-";
-    text += "GENRE: ";
+    if (text.length() > 0) text += "  ";
     text += currentGenres;
   }
   if (currentSongTitle.length() > 0) {
-    if (text.length() > 0) text += "-";
+    if (text.length() > 0) text += "  ";
     text += "NOW PLAYING: ";
     text += currentSongTitle;
   }
 
   if (text.length() == 0) text = "E R U P T I O N   R A D I O   U K";
-  streamTitle = text + " reload ";
+  streamTitle = text + "   ";
 }
 
 bool fetchScheduleNow() {
