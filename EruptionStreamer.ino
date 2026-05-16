@@ -61,7 +61,7 @@
 // ------------------------------------------------------------
 #define MAX_BANDS 14
 
-uint16_t spectrumBandsAddr = 0;  // STARTET BEI 0 FÜR DYNAMISCHE ERKENNUNG
+uint16_t spectrumBandsAddr = 0; // STARTET BEI 0 FÜR DYNAMISCHE ERKENNUNG
 uint16_t spectrumDataAddr = 0;
 
 // ------------------------------------------------------------
@@ -99,62 +99,69 @@ unsigned long lastSpectrumDebug = 0;
 unsigned long dotTimer = 0;
 
 // ------------------------------------------------------------
+// DYNAMISCHE METADATEN SPEICHER
+// ------------------------------------------------------------
+String stationName = "Loading...";
+String streamTitle = "E R U P T I O N   R A D I O   U K           "; // Fallback
+int metaInterval = 0;          // Wert aus 'icy-metaint'
+int byteCounter = 0;           // Zählt gelesene Audio-Bytes bis zur nächsten Meta-Info
+
+// Vorwärtsdeklarationen
+void printSystemInfo();
+bool initVS1053Reliable();
+bool loadSpectrumPluginReliable();
+void initDisplay();
+void showMessage(const char* msg);
+void connectToWiFi();
+void connectToStream();
+void maintainWiFi();
+void readStreamToVS1053();
+void handleReconnectIfNeeded();
+bool skipAndParseHttpHeaders();
+void readSpectrum();
+void drawSpectrum();
+
+// ------------------------------------------------------------
 // SETUP
 // ------------------------------------------------------------
-
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(115200);
   delay(1000);
 
   Serial.println();
   Serial.println("=======================================");
-  Serial.println(" ESP32 Eruption Radio UK + VS1053 FFT");
-  Serial.println(" Stabile Init-Version (Dynamic Fix 2)");
+  Serial.println(" ESP32 Radio + Dynamische Metadaten");
   Serial.println("=======================================");
   Serial.println();
 
   printSystemInfo();
 
-  // 1. VS1053 initialisieren
-  vs1053Ready = initVS1053Reliable();
-
-  if (!vs1053Ready) {
+  if (!initVS1053Reliable()) {
     Serial.println("[STOP] VS1053 konnte nicht initialisiert werden.");
     while (true) { delay(1000); }
   }
 
-  // 2. Plugin laden
   pluginReady = loadSpectrumPluginReliable();
 
-  // 3. OLED starten
 #if USE_DISPLAY
   initDisplay();
   showMessage("VS1053 OK");
 #endif
 
-  // 4. WLAN starten
   connectToWiFi();
-
-  // 5. Stream verbinden
   connectToStream();
 }
 
 // ------------------------------------------------------------
 // LOOP
 // ------------------------------------------------------------
-
 void loop() {
   maintainWiFi();
-
-  // Verarbeitet Audio-Daten häppchenweise ohne Blockieren
   readStreamToVS1053();
 
-  // FFT & Display alle 80ms aktualisieren
   if (millis() - lastSpectrumRead > SPECTRUM_INTERVAL_MS) {
     if (pluginReady) {
       readSpectrum();
-
 #if USE_DISPLAY
       if (spectrumBandsAddr != 0) {
         drawSpectrum();
@@ -164,13 +171,10 @@ void loop() {
     lastSpectrumRead = millis();
   }
 
-  // Debug-Ausgaben alle 2 Sekunden
   if (millis() - lastSpectrumDebug > DEBUG_INTERVAL_MS) {
-    if (pluginReady && spectrumBandsAddr != 0) {
-     // printSpectrumDebug();
-    } else if (!pluginReady) {
+    if (!pluginReady) {
       Serial.println("[SPEC] Plugin nicht bereit.");
-    } else {
+    } else if (spectrumBandsAddr == 0) {
       Serial.println("[SPEC] Warte auf gueltige FFT-Daten vom DSP...");
     }
     lastSpectrumDebug = millis();
@@ -182,7 +186,6 @@ void loop() {
 // ------------------------------------------------------------
 // Systeminfo
 // ------------------------------------------------------------
-
 void printSystemInfo() {
   Serial.print("[SYS] CPU MHz: ");
   Serial.println(getCpuFrequencyMhz());
@@ -194,7 +197,6 @@ void printSystemInfo() {
 // ------------------------------------------------------------
 // VS1053 INIT
 // ------------------------------------------------------------
-
 bool initVS1053Reliable() {
   Serial.println("[VS1053] Initialisiere...");
 
@@ -206,7 +208,6 @@ bool initVS1053Reliable() {
   digitalWrite(VS1053_CS, HIGH);
   digitalWrite(VS1053_DCS, HIGH);
   digitalWrite(VS1053_RST, HIGH);
-
   delay(100);
 
   SPI.begin(ESP32_SCK, ESP32_MISO, ESP32_MOSI, VS1053_CS);
@@ -218,7 +219,6 @@ bool initVS1053Reliable() {
 
     digitalWrite(VS1053_CS, HIGH);
     digitalWrite(VS1053_DCS, HIGH);
-
     digitalWrite(VS1053_RST, LOW);
     delay(100);
     digitalWrite(VS1053_RST, HIGH);
@@ -230,14 +230,12 @@ bool initVS1053Reliable() {
     uint8_t version = player.getChipVersion();
     Serial.print("[VS1053] Chip Version: ");
     Serial.println(version);
-
     if (version == 4) {
       player.switchToMp3Mode();
       delay(50);
       player.setVolume(VOLUME);
       delay(50);
       Serial.println("[VS1053] OK");
-      Serial.println();
       return true;
     }
     delay(500);
@@ -247,10 +245,8 @@ bool initVS1053Reliable() {
 
 bool resetVS1053ForReconnect() {
   Serial.println("[VS1053] Reset fuer Reconnect...");
-
   digitalWrite(VS1053_CS, HIGH);
   digitalWrite(VS1053_DCS, HIGH);
-
   digitalWrite(VS1053_RST, LOW);
   delay(100);
   digitalWrite(VS1053_RST, HIGH);
@@ -259,31 +255,21 @@ bool resetVS1053ForReconnect() {
   player.begin();
   delay(100);
 
-  uint8_t version = player.getChipVersion();
-  if (version != 4) return false;
-
+  if (player.getChipVersion() != 4) return false;
   player.switchToMp3Mode();
   delay(50);
   player.setVolume(VOLUME);
   delay(50);
-
   return true;
 }
 
 // ------------------------------------------------------------
 // Spectrum Plugin
 // ------------------------------------------------------------
-
 bool loadSpectrumPluginReliable() {
-  Serial.println("[PLUGIN] Lade Spectrum Analyzer Plugin in den RAM...");
-
-  player.loadUserCode(
-    spectrumAnalyzer1053bPlugin,
-    SPECTRUM_ANALYZER_1053B_PLUGIN_SIZE);
-
+  Serial.println("[PLUGIN] Lade Spectrum Analyzer Plugin...");
+  player.loadUserCode(spectrumAnalyzer1053bPlugin, SPECTRUM_ANALYZER_1053B_PLUGIN_SIZE);
   delay(300);
-  Serial.println("[PLUGIN] Geladen. Erkennung laeuft im Betrieb.");
-  Serial.println();
   return true;
 }
 
@@ -294,8 +280,6 @@ uint16_t readVS1053Wram(uint16_t address) {
 
 void readSpectrum() {
   if (!pluginReady) return;
-
-  // Dynamische Erkennung während Musik läuft
   if (spectrumBandsAddr == 0) {
     uint16_t bands_1802 = readVS1053Wram(0x1802);
     uint16_t bands_1812 = readVS1053Wram(0x1812);
@@ -304,25 +288,18 @@ void readSpectrum() {
       spectrumBandsAddr = 0x1802;
       spectrumDataAddr = 0x1804;
       bandCount = bands_1802;
-      Serial.print("\n[PLUGIN] Erkennung ERFOLGREICH bei Adresse 0x1802! Bands: ");
-      Serial.println(bandCount);
     } else if (bands_1812 > 0 && bands_1812 <= MAX_BANDS) {
       spectrumBandsAddr = 0x1812;
       spectrumDataAddr = 0x1824;
       bandCount = bands_1812;
-      Serial.print("\n[PLUGIN] Erkennung ERFOLGREICH bei Adresse 0x1812! Bands: ");
-      Serial.println(bandCount);
     } else {
-      return;  // DSP dekodiert noch nicht lang genug, im nächsten Intervall erneut versuchen
+      return;
     }
   }
 
-  // Daten auslesen
   player.writeRegister(SCI_WRAMADDR, spectrumDataAddr);
-
   for (uint8_t i = 0; i < bandCount; i++) {
     uint16_t raw = player.readRegister(SCI_WRAM);
-
     uint8_t current = raw & 0x3F;
     uint8_t peak = (raw >> 6) & 0x3F;
 
@@ -330,29 +307,14 @@ void readSpectrum() {
     if (peak > 31) peak = 31;
 
     spectrum[i] = current;
-
-    if (peak > peaks[i]) {
-      peaks[i] = peak;
-    } else if (peaks[i] > 0) {
-      peaks[i]--;
-    }
+    if (peak > peaks[i]) peaks[i] = peak;
+    else if (peaks[i] > 0) peaks[i]--;
   }
-}
-
-void printSpectrumDebug() {
-
-  Serial.print("[SPEC] ");
-  for (uint8_t i = 0; i < bandCount; i++) {
-    Serial.print(spectrum[i]);
-    if (i < bandCount - 1) Serial.print(",");
-  }
-  Serial.println();
 }
 
 // ------------------------------------------------------------
 // OLED
 // ------------------------------------------------------------
-
 void initDisplay() {
 #if USE_DISPLAY
   Serial.println("[OLED] Initialisiere...");
@@ -364,24 +326,20 @@ void initDisplay() {
     displayReady = false;
     return;
   }
-
   displayReady = true;
-  Serial.println("[OLED] OK");
   showMessage("Boot OK");
-  Serial.println();
 #endif
 }
 
 void showMessage(const char* msg) {
 #if USE_DISPLAY
   if (!displayReady) return;
-
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
   display.setCursor(0, 0);
-  display.println("Eruption Radio UK");
+  display.println(stationName); 
   display.setCursor(0, 18);
   display.println(msg);
   display.display();
@@ -390,37 +348,31 @@ void showMessage(const char* msg) {
 
 void drawSpectrum() {
 #if USE_DISPLAY
-  if (!displayReady) return;
-  if (!pluginReady) return;
-  if (spectrumBandsAddr == 0 || bandCount == 0) return;
+  if (!displayReady || !pluginReady || spectrumBandsAddr == 0 || bandCount == 0) return;
 
   display.clearDisplay();
 
-  int centerY = 32;     
+  int centerY = 32;
   int maxHalfHeight = 31; 
   int barWidth = 11;      
   int gap = 2;
   int startX = 0;
 
-  // 1. ZUERST DIE BALKEN ZEICHNEN
   for (uint8_t i = 0; i < 10; i++) {
-    if (i >= bandCount) break; 
-
+    if (i >= bandCount) break;
     float currentGain = 22.0;
-    if (i == 0 || i == 1) currentGain = 22.0; 
-    else if (i <= 4)      currentGain = 20.0; 
-    else if (i <= 6)      currentGain = 18.0; 
-    else if (i == 7)      currentGain = 16.0; 
-    else                  currentGain = 14.0; 
+    if (i == 0 || i == 1) currentGain = 22.0;
+    else if (i <= 4)      currentGain = 20.0;
+    else if (i <= 6)      currentGain = 18.0;
+    else if (i == 7)      currentGain = 16.0;
+    else                  currentGain = 14.0;
 
     int halfBarH = map(constrain(spectrum[i], 0, currentGain), 0, currentGain, 0, maxHalfHeight);
     int x = startX + (i * (barWidth + gap));
-
     if (halfBarH > 0) {
       int yTop = centerY - halfBarH;
       int yBottom = centerY + halfBarH;
 
-      // 5-Stufen-Raster
       if (halfBarH >= 25) {
         display.fillRect(x, yTop, barWidth, halfBarH * 2, SSD1306_WHITE);
       }
@@ -455,57 +407,43 @@ void drawSpectrum() {
     }
   }
 
-  // 2. JETZT DEN FETTEN HALBSINUS-HÜPFENDEN TEXT DARÜBERSTANZEN
-  static int scrollX = 128; 
+  // 2. JETZT DEN FETTEN TEXT DARÜBERSTANZEN (Optimiert für Schriftgröße 3)
+  static int scrollX = 128;
   static unsigned long lastScroll = 0;
-  static float angleOffset = 0; // Bestimmt die Wellenbewegung über die Zeit
+  static float angleOffset = 0;
   
-  const char* tickerText = "E R U P T I O N   R A D I O   U K           "; 
-  int textLength = strlen(tickerText);
+  int textLength = streamTitle.length();
 
-  display.setTextSize(3);
-  display.setTextColor(SSD1306_BLACK); // Ausstanzen
+  display.setTextSize(3); // <--- EXAKT AUF GRÖSSE 3 GESTELLT
+  display.setTextColor(SSD1306_BLACK); 
   display.setTextWrap(false);
 
   int currentX = scrollX;
-
-  // Wir müssen jeden Buchstaben einzeln zeichnen, damit er ein eigenes Y bekommt
   for (int charIdx = 0; charIdx < textLength; charIdx++) {
-    char c = tickerText[charIdx];
+    char c = streamTitle[charIdx];
+    
+    // Sichtbereich für Schriftgröße 3 prüfen (ein Zeichen ist ca. 18 Pixel breit)
+    if (currentX >= -18 && currentX < 128) {
+      float angle = angleOffset + (charIdx * 0.15);
+      int yOffset = abs(sin(angle)) * 12; // Schön flüssige 12 Pixel Bouncing-Höhe
+      int targetY = 30 - yOffset; 
 
-    // Nur zeichnen, wenn der Buchstabe im sichtbaren Bereich ist
-    if (currentX >= -6 && currentX < 128) {
-      
-      // Berechne den Sinus-Winkel für DIESEN spezifischen Buchstaben
-      // charIdx * 0.5 sorgt für den Phasenversatz (jeder Buchstabe ist an einer anderen Stelle der Welle)
-      float angle = angleOffset + (charIdx * 0.1);
-      
-      // abs(sin()) erzeugt die harte "Bounce"-Kurve eines springenden Balls (Halbsinus)
-      // Der Buchstabe hüpft bis zu 12 Pixel weit nach oben aus der Mitte heraus
-      int yOffset = abs(sin(angle)) * 12; 
-      int targetY = 28 - yOffset; // Von der Mittellinie (28) nach oben abziehen
-
-      // --- DER TRICK FÜR FETTSCHRIFT ---
-      // Buchstabe 1 zeichnen
+      // Fett-Effekt durch minimal versetzten Zweitdruck
       display.setCursor(currentX, targetY);
       display.print(c);
-      // Buchstabe 2 minimal versetzt zeichnen -> macht es fett!
-      display.setCursor(currentX + 1, targetY);
+      display.setCursor(currentX + 1, targetY); 
       display.print(c);
-
     }
-    
-    // Abstand zum nächsten Zeichen (Fette Schrift braucht 1px mehr Platz)
-    currentX += 9; 
+    currentX += 19; // Exakter Schrittabstand für Textgröße 3 mit Fett-Effekt
   }
 
-  // Ticker-Geschwindigkeit und Animations-Takt
-  if (millis() - lastScroll >= 25) {
-    scrollX--; // Text wandert nach links
-    angleOffset += 0.15; // Erhöht die Geschwindigkeit des Hüpfens
+  // Ticker-Geschwindigkeit
+  if (millis() - lastScroll >= 30) {
+    scrollX--;
+    angleOffset += 0.13;
     
-    if (scrollX < -(textLength * 7)) { 
-      scrollX = 128; 
+    if (scrollX < -(textLength * 19)) { 
+      scrollX = 128;
     }
     lastScroll = millis();
   }
@@ -517,7 +455,6 @@ void drawSpectrum() {
 // ------------------------------------------------------------
 // WLAN
 // ------------------------------------------------------------
-
 void connectToWiFi() {
   Serial.println("[WIFI] Verbinde...");
   WiFi.mode(WIFI_STA);
@@ -534,27 +471,23 @@ void connectToWiFi() {
     Serial.print(".");
   }
   Serial.println();
-
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WIFI] FEHLER");
-    showMessage("WiFi Fehler");
+    stationName = "WiFi Fehler";
+    showMessage("FEHLER");
     return;
   }
-
-  Serial.println("[WIFI] OK");
-  showMessage("WiFi OK");
-  Serial.println();
+  stationName = "WiFi Connected";
+  showMessage("OK");
 }
 
 void maintainWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
-  Serial.println("\n[WIFI] Verbindung verloren. Reconnect...");
-  showMessage("WiFi reconnect");
+  stationName = "WiFi lost";
+  showMessage("Reconnect...");
 
   WiFi.disconnect();
   WiFi.begin(ssid, pass);
-
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
     delay(500);
@@ -567,63 +500,127 @@ void maintainWiFi() {
 }
 
 // ------------------------------------------------------------
-// Stream
+// Stream & Metadaten Parser
 // ------------------------------------------------------------
-
 void connectToStream() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   Serial.println("[STREAM] Verbinde...");
+  stationName = "Connecting...";
   showMessage("Stream...");
 
   client.stop();
   delay(300);
-
   if (!client.connect(STREAM_HOST, STREAM_PORT)) {
-    Serial.println("[STREAM] TCP FEHLER");
-    showMessage("Stream Fehler");
+    stationName = "Stream Error";
+    showMessage("TCP FEHLER");
     streamReady = false;
     return;
   }
 
-  client.print(String("GET ") + STREAM_PATH + " HTTP/1.0\r\n" + "Host: " + STREAM_HOST + "\r\n" + "User-Agent: ESP32-VS1053-Radio\r\n" + "Icy-MetaData: 0\r\n" + "Connection: close\r\n\r\n");
+  client.print(String("GET ") + STREAM_PATH + " HTTP/1.0\r\n" +
+               "Host: " + STREAM_HOST + "\r\n" +
+               "User-Agent: ESP32-VS1053-Radio\r\n" +
+               "Icy-MetaData: 1\r\n" + 
+               "Connection: close\r\n\r\n");
 
-  if (!skipHttpHeaders()) {
-    Serial.println("[STREAM] Header FEHLER");
-    showMessage("Header Fehler");
+  if (!skipAndParseHttpHeaders()) {
+    stationName = "Header Error";
+    showMessage("FEHLER");
     streamReady = false;
     return;
   }
 
   Serial.println("[STREAM] Datenstrom laeuft.");
   streamReady = true;
+  byteCounter = 0;
   lastDataTime = millis();
-  showMessage("Playing...");
 }
 
-bool skipHttpHeaders() {
+bool skipAndParseHttpHeaders() {
   unsigned long start = millis();
+  metaInterval = 0;
+  stationName = "Radio Stream"; 
+
   while (client.connected() && millis() - start < 7000) {
     if (client.available()) {
       String line = client.readStringUntil('\n');
       line.trim();
-      if (line.length() == 0) return true;
+      
+      if (line.length() == 0) return true; 
+
+      // Sendernamen auslesen
+      if (line.startsWith("icy-name:")) {
+        stationName = line.substring(9);
+        stationName.trim();
+        Serial.print("[META] Sendername: ");
+        Serial.println(stationName);
+        
+        // Zwingt den Sendernamen direkt in den Scroller beim Start!
+        streamTitle = stationName + "          "; 
+      }
+      
+      // Metadaten-Intervall auslesen
+      if (line.startsWith("icy-metaint:")) {
+        metaInterval = line.substring(12).toInt();
+        Serial.print("[META] Intervall: ");
+        Serial.println(metaInterval);
+      }
+
+      // Bitrate auslesen
+      if (line.startsWith("icy-br:")) {
+        String bitrate = line.substring(7);
+        bitrate.trim();
+        Serial.print("[META] Bitrate: ");
+        Serial.print(bitrate);
+        Serial.println(" kbps");
+      }
     }
   }
   return false;
 }
 
-// HIER WAR DIE BLOCKADE: Jetzt limitiert auf max. 10 Chunks pro Aufruf!
 void readStreamToVS1053() {
   if (!streamReady) return;
-
   uint8_t chunksProcessed = 0;
 
   while (client.available() > 0 && chunksProcessed < 10) {
-    int bytesRead = client.read(mp3buff, sizeof(mp3buff));
+    
+    if (metaInterval > 0 && byteCounter == metaInterval) {
+      int metaLen = client.read();
+      if (metaLen > 0) {
+        metaLen *= 16;
+        String metaString = "";
+        while (metaString.length() < metaLen) {
+          if (client.available()) {
+            metaString += (char)client.read();
+          }
+        }
+        
+        if (metaString.indexOf("StreamTitle='") != -1) {
+          int startIdx = metaString.indexOf("StreamTitle='") + 13;
+          int endIdx = metaString.indexOf("';", startIdx);
+          if (endIdx > startIdx) {
+            streamTitle = metaString.substring(startIdx, endIdx);
+            streamTitle += "      "; 
+            Serial.print("[META] Songtitel: ");
+            Serial.println(streamTitle);
+          }
+        }
+      }
+      byteCounter = 0; 
+    }
+
+    int bytesToRead = sizeof(mp3buff);
+    if (metaInterval > 0 && (byteCounter + bytesToRead > metaInterval)) {
+      bytesToRead = metaInterval - byteCounter; 
+    }
+
+    int bytesRead = client.read(mp3buff, bytesToRead);
     if (bytesRead > 0) {
       lastDataTime = millis();
       player.playChunk(mp3buff, bytesRead);
+      byteCounter += bytesRead;
       chunksProcessed++;
 
       if (millis() - dotTimer > 1000) {
@@ -651,11 +648,10 @@ void handleReconnectIfNeeded() {
   streamReady = false;
   client.stop();
   delay(300);
-
-  bool resetOk = resetVS1053ForReconnect();
-  if (resetOk) {
+  
+  if (resetVS1053ForReconnect()) {
     pluginReady = loadSpectrumPluginReliable();
-    spectrumBandsAddr = 0;  // Adresse zurücksetzen für Neuerkennung
+    spectrumBandsAddr = 0;
   } else {
     pluginReady = false;
   }
